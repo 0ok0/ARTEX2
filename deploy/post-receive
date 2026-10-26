@@ -1,0 +1,21 @@
+#!/bin/sh
+# post-receive 钩子：本地 git push 后自动更新 ARTEX 部署
+# 放置位置：<bare仓库>/hooks/post-receive，并 chmod +x
+# 日志：tail -f /volume1/git/artex-deploy.log
+
+DEPLOY_DIR=/volume1/docker/artex
+LOG=/volume1/git/artex-deploy.log
+
+# 只处理 main 分支
+while read oldrev newrev refname; do
+    if [ "$refname" != "refs/heads/main" ]; then
+        continue
+    fi
+    {
+        echo "===== $(date '+%F %T') 收到 push: $oldrev -> $newrev ====="
+        cd "$DEPLOY_DIR" || { echo "部署目录不存在: $DEPLOY_DIR"; exit 1; }
+        git pull || exit 1
+        docker compose up -d --build artex
+        echo "===== 部署完成 ====="
+    } >> "$LOG" 2>&1
+done
