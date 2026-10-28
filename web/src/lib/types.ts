@@ -1378,6 +1378,18 @@ export interface SSTask {
   endTime?: string;
 }
 
+// EngineAsset — 互联网测绘引擎归一化后的单条资产（FOFA/Quake/Hunter/ZoomEye/Shodan/Censys）
+export interface EngineAsset {
+  host: string;
+  ip: string;
+  port: number;
+  title: string;
+  domain: string;
+  org: string;
+  url: string;
+  service: string;
+}
+
 // ConvTokenSummary — one conversation's token total (+ profile/date) for merging
 // chat usage into the dashboard token stats. GET /api/tokens/conversations.
 export interface ConvTokenSummary {

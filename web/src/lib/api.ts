@@ -78,6 +78,7 @@ import type {
   SkillItem,
   SSProject,
   SSTask,
+  EngineAsset,
   Stats,
   Task,
   TaskArchive,
@@ -1136,6 +1137,37 @@ export const api = {
       warnings: string[] | null;
       errors: string[] | null;
     }>("/sync/scopesentry/sync", body),
+
+  // ---- 资产同步（互联网测绘引擎）----
+  enginesStatus: () =>
+    get<{
+      engines: Record<string, { enabled: boolean; configured: boolean; base_url: string }>;
+      llm_ready: boolean;
+      llm_model?: string;
+    }>("/sync/engines/status"),
+  enginesDatasource: (body: { engine: string; enabled?: boolean; key?: string; base_url?: string }) =>
+    post<{ engine: string; enabled: boolean; configured: boolean }>("/sync/engines/datasource", body),
+  enginesSearch: (body: { engine: string; query: string; intent?: boolean; page?: number; size?: number }) =>
+    post<{ query: string; page: { assets: EngineAsset[]; total: number; next_cursor?: string } }>(
+      "/sync/engines/search",
+      body,
+    ),
+  enginesSync: (body: {
+    engine: string;
+    query: string;
+    intent?: boolean;
+    max_pages?: number;
+    page_size?: number;
+    create_company?: boolean;
+  }) =>
+    post<{
+      engine: string;
+      query: string;
+      synced: Record<string, number>;
+      companies: string[] | null;
+      warnings: string[] | null;
+      errors: string[] | null;
+    }>("/sync/engines/sync", body),
 
   // ---- skills (文件系统) ----
   skills: () => get<{ skills: SkillItem[] }>("/skills").then((r) => arr(r.skills)),

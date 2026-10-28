@@ -2385,6 +2385,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/sync/scopesentry/tasks") return { tasks: [] };
   if (path === "/sync/scopesentry/sync") return { synced: {}, companies: null, warnings: null, errors: null };
 
+  // ── 测绘引擎（demo：未配置、无结果）──
+  if (path === "/sync/engines/status") {
+    const engines: Record<string, { enabled: boolean; configured: boolean; base_url: string }> = {};
+    for (const e of ["fofa", "quake", "hunter", "zoomeye", "shodan", "censys"]) {
+      engines[e] = { enabled: false, configured: false, base_url: "" };
+    }
+    return { engines, llm_ready: false };
+  }
+  if (path === "/sync/engines/datasource") return { engine: "fofa", enabled: false, configured: false };
+  if (path === "/sync/engines/search") return { query: "", page: { assets: [], total: 0 } };
+  if (path === "/sync/engines/sync") return { engine: "fofa", query: "", synced: {}, companies: null, warnings: null, errors: null };
+
   // ── skills ──
   if (path === "/skills" && m === "GET") return { skills: D.skills };
   if (path === "/skills/missing") return { missing: D.missingSkills };

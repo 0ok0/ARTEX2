@@ -3087,6 +3087,14 @@ function CreateTaskSheet({
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
+  // 测绘搜资产：创建任务前先用测绘引擎拉一批资产入库，并按主域建企业/范围。
+  const [reconEngine, setReconEngine] = React.useState("");
+  const [reconQuery, setReconQuery] = React.useState("");
+  const [reconIntent, setReconIntent] = React.useState(false);
+  const [reconMaxPages, setReconMaxPages] = React.useState(3);
+  const [reconSyncing, setReconSyncing] = React.useState(false);
+  const [reconResult, setReconResult] = React.useState<{ total: number; companies: string[] } | null>(null);
+  const [reconCompanies, setReconCompanies] = React.useState<number[]>([]);
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
@@ -3129,6 +3137,44 @@ function CreateTaskSheet({
     }
   }
 
+  // runRecon 在建任务前调测绘引擎拉资产入库；返回后刷新企业列表并自动勾选新建企业，
+  // 使任务范围直接包含刚搜到的资产。
+  async function runRecon() {
+    if (!reconEngine || !reconQuery.trim()) {
+      toast.error("请选择引擎并填写查询内容");
+      return;
+    }
+    setReconSyncing(true);
+    setReconResult(null);
+    try {
+      const r = await api.enginesSync({
+        engine: reconEngine,
+        query: reconQuery.trim(),
+        intent: reconIntent,
+        max_pages: reconMaxPages,
+        create_company: true,
+      });
+      const total = Object.entries(r.synced ?? {})
+        .filter(([k]) => k !== "skipped")
+        .reduce((a, [, b]) => a + b, 0);
+      setReconResult({ total, companies: r.companies ?? [] });
+      const before = new Set(companies.map((c) => c.id));
+      try {
+        const fresh = await api.companies();
+        setCompanies(fresh);
+        const newIds = fresh.filter((c) => !before.has(c.id)).map((c) => c.id);
+        if (newIds.length > 0) setReconCompanies((prev) => [...new Set([...prev, ...newIds])]);
+      } catch {
+        /* 企业刷新失败不影响主流程 */
+      }
+      toast.success(`测绘入库 ${total} 条资产`);
+    } catch (e) {
+      toast.error(`测绘失败：${(e as Error).message}`);
+    } finally {
+      setReconSyncing(false);
+    }
+  }
+
   async function createTask() {
     if (!description.trim() || !goal.trim()) {
       toast.error("请填写描述与目标");
@@ -3149,7 +3195,7 @@ function CreateTaskSheet({
         goal: goal.trim(),
         llmProfileIds: llmProfileIDs.map(Number),
         sourceTaskIds: sourceTaskIDs,
-        companyIds: companyIDs,
+        companyIds: [...new Set([...companyIDs, ...reconCompanies])],
         timeoutSeconds: timeoutSec,
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
@@ -3310,6 +3356,66 @@ function CreateTaskSheet({
                 创建任务时会将所选企业当前已有资产加入“测试资产”，并将域名、IP、CIDR、ICP 和企业关键词提供给 Agent
                 作为范围上下文；不会自动生成意图或强制改变执行目标。
               </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>测绘搜资产（可选）</FieldLabel>
+              <div className="space-y-2 rounded-md border p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    className="h-9 rounded-md border bg-transparent px-2 text-sm"
+                    value={reconEngine}
+                    onChange={(e) => setReconEngine(e.target.value)}
+                  >
+                    <option value="">选择引擎…</option>
+                    <option value="fofa">FOFA</option>
+                    <option value="quake">Quake</option>
+                    <option value="hunter">Hunter</option>
+                    <option value="zoomeye">ZoomEye</option>
+                    <option value="shodan">Shodan</option>
+                    <option value="censys">Censys</option>
+                  </select>
+                  <label className="flex items-center gap-1.5 text-xs">
+                    <Checkbox checked={reconIntent} onCheckedChange={(v) => setReconIntent(!!v)} />
+                    大白话意图（LLM 转写）
+                  </label>
+                  <label className="flex items-center gap-1.5 text-xs">
+                    翻页
+                    <Input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={reconMaxPages}
+                      onChange={(e) => setReconMaxPages(Math.max(1, Number(e.target.value) || 1))}
+                      className="h-8 w-16"
+                    />
+                  </label>
+                  <div className="flex-1" />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void runRecon()}
+                    disabled={reconSyncing || !reconEngine}
+                  >
+                    {reconSyncing ? "拉取中…" : "拉取资产"}
+                  </Button>
+                </div>
+                <Input
+                  placeholder={reconIntent ? "大白话需求，例：教育行业的统一身份认证登录页" : "查询语法，例：title=\"统一身份认证\" && domain=\".edu.cn\""}
+                  value={reconQuery}
+                  onChange={(e) => setReconQuery(e.target.value)}
+                />
+                <p className="text-muted-foreground text-xs">
+                  拉取的资产直接入库并按主域建立企业，新建企业自动勾选进上方「关联企业资产范围」，任务范围即刻覆盖搜到的资产。
+                  引擎 Key 在「资产同步 → 测绘引擎」页配置。
+                </p>
+                {reconResult && (
+                  <p className="text-xs">
+                    已入库 <b>{reconResult.total}</b> 条资产
+                    {reconResult.companies.length > 0 && `；企业：${reconResult.companies.join("、")}`}
+                  </p>
+                )}
+              </div>
             </Field>
             <Field>
               <FieldLabel htmlFor="task-intercept-rules">任务级资产拦截 / 允许规则（可选）</FieldLabel>

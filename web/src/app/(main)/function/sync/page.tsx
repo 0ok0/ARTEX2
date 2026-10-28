@@ -14,7 +14,7 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { SSProject, SSTask } from "@/lib/types";
+import type { EngineAsset, SSProject, SSTask } from "@/lib/types";
 
 type SSStatus = {
   exists: boolean;
@@ -43,9 +43,13 @@ export default function AssetSyncPage() {
       <Tabs defaultValue="scopesentry">
         <TabsList>
           <TabsTrigger value="scopesentry">ScopeSentry</TabsTrigger>
+          <TabsTrigger value="engines">测绘引擎</TabsTrigger>
         </TabsList>
         <TabsContent value="scopesentry" className="mt-4">
           <ScopeSentryPanel />
+        </TabsContent>
+        <TabsContent value="engines" className="mt-4">
+          <EnginesPanel />
         </TabsContent>
       </Tabs>
     </div>
@@ -482,5 +486,313 @@ function SyncResult({ result }: { result: Awaited<ReturnType<typeof api.ssSync>>
         </ul>
       )}
     </div>
+  );
+}
+
+// ── 互联网测绘引擎（FOFA/Quake/Hunter/ZoomEye/Shodan/Censys）─────────────────
+
+type EngineStatus = Record<string, { enabled: boolean; configured: boolean; base_url: string }>;
+
+const ENGINE_META: { key: string; label: string; placeholder: string }[] = [
+  { key: "fofa", label: "FOFA", placeholder: 'title="统一身份认证" && domain=".edu.cn"' },
+  { key: "quake", label: "Quake", placeholder: "title:'统一身份认证' AND domain:.edu.cn" },
+  { key: "hunter", label: "Hunter", placeholder: 'web.title="统一身份认证"' },
+  { key: "zoomeye", label: "ZoomEye", placeholder: "title:'统一身份认证' +site:.edu.cn" },
+  { key: "shodan", label: "Shodan", placeholder: "http.title:'unified auth'" },
+  { key: "censys", label: "Censys", placeholder: "web.body:'unified auth'" },
+];
+
+function EnginesPanel() {
+  const [status, setStatus] = React.useState<{ engines: EngineStatus; llm_ready: boolean } | null>(null);
+  const [loading, setLoading] = React.useState(true);
+
+  const load = React.useCallback(() => {
+    setLoading(true);
+    api
+      .enginesStatus()
+      .then(setStatus)
+      .catch((e) => toast.error(`读取引擎状态失败：${e.message}`))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <PlugZapIcon className="size-4" /> 引擎配置
+            {status && !status.llm_ready && (
+              <Badge variant="outline">LLM 未配置 · 仅支持查询语法</Badge>
+            )}
+          </CardTitle>
+          <Button variant="ghost" size="sm" onClick={load} disabled={loading}>
+            <RefreshCwIcon className={loading ? "size-4 animate-spin" : "size-4"} /> 刷新
+          </Button>
+        </CardHeader>
+        <CardContent>
+          <p className="text-muted-foreground mb-3 text-sm">
+            填好 Key 并启用后即可搜索。查询按所选引擎官网语法原样请求；也可切到大白话意图，由 LLM 转写为语法。
+          </p>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {ENGINE_META.map((m) => (
+              <EngineCard
+                key={m.key}
+                meta={m}
+                st={status?.engines?.[m.key]}
+                onChanged={load}
+              />
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+      <EnginesWorkbench status={status} />
+    </div>
+  );
+}
+
+function EngineCard({
+  meta,
+  st,
+  onChanged,
+}: {
+  meta: { key: string; label: string; placeholder: string };
+  st?: { enabled: boolean; configured: boolean; base_url: string };
+  onChanged: () => void;
+}) {
+  const [key, setKey] = React.useState("");
+  const [baseUrl, setBaseUrl] = React.useState("");
+  const [enabled, setEnabled] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (st) {
+      setBaseUrl(st.base_url ?? "");
+      setEnabled(st.enabled);
+    }
+  }, [st]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.enginesDatasource({
+        engine: meta.key,
+        key: key.trim() || undefined,
+        base_url: baseUrl.trim() || undefined,
+        enabled: enabled,
+      });
+      toast.success(`${meta.label} 已保存`);
+      setKey("");
+      onChanged();
+    } catch (e) {
+      toast.error(`保存失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2 rounded-md border p-3">
+      <div className="flex items-center justify-between">
+        <span className="font-medium text-sm">{meta.label}</span>
+        {st?.configured ? (
+          <Badge className="bg-emerald-600 hover:bg-emerald-600">已配置</Badge>
+        ) : (
+          <Badge variant="outline">未配置</Badge>
+        )}
+      </div>
+      <Input
+        type="password"
+        placeholder="API Key（留空保留原值）"
+        value={key}
+        onChange={(e) => setKey(e.target.value)}
+      />
+      <Input
+        placeholder="自定义端点（可选）"
+        value={baseUrl}
+        onChange={(e) => setBaseUrl(e.target.value)}
+      />
+      <div className="flex items-center justify-between">
+        <label htmlFor={`en-${meta.key}`} className="flex items-center gap-1.5 text-sm">
+          <Checkbox
+            id={`en-${meta.key}`}
+            checked={enabled}
+            onCheckedChange={(c) => setEnabled(!!c)}
+          />
+          启用
+        </label>
+        <Button size="sm" variant="outline" onClick={save} disabled={busy}>
+          保存
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function EnginesWorkbench({
+  status,
+}: {
+  status: { engines: EngineStatus; llm_ready: boolean } | null;
+}) {
+  const [engine, setEngine] = React.useState("fofa");
+  const [mode, setMode] = React.useState<"syntax" | "intent">("syntax");
+  const [query, setQuery] = React.useState("");
+  const [maxPages, setMaxPages] = React.useState(5);
+  const [createCompany, setCreateCompany] = React.useState(true);
+
+  const [preview, setPreview] = React.useState<EngineAsset[]>([]);
+  const [resolvedQuery, setResolvedQuery] = React.useState("");
+  const [searching, setSearching] = React.useState(false);
+  const [syncing, setSyncing] = React.useState(false);
+  const [result, setResult] = React.useState<Awaited<ReturnType<typeof api.enginesSync>> | null>(null);
+
+  const meta = ENGINE_META.find((m) => m.key === engine) ?? ENGINE_META[0];
+  const configured = !!status?.engines?.[engine]?.configured && !!status?.engines?.[engine]?.enabled;
+
+  const doSearch = async () => {
+    if (!query.trim()) return toast.error("请输入查询内容");
+    setSearching(true);
+    setPreview([]);
+    try {
+      const r = await api.enginesSearch({ engine, query: query.trim(), intent: mode === "intent", page: 1, size: 50 });
+      setResolvedQuery(r.query);
+      setPreview(r.page.assets ?? []);
+      toast.success(`预览返回 ${(r.page.assets ?? []).length} 条`);
+    } catch (e) {
+      toast.error(`搜索失败：${(e as Error).message}`);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const doSync = async () => {
+    if (!query.trim()) return toast.error("请输入查询内容");
+    setSyncing(true);
+    setResult(null);
+    try {
+      const r = await api.enginesSync({
+        engine,
+        query: query.trim(),
+        intent: mode === "intent",
+        max_pages: maxPages,
+        create_company: createCompany,
+      });
+      setResult(r);
+      const total = Object.values(r.synced ?? {}).reduce((a, b) => a + b, 0);
+      toast.success(`同步完成，共入库 ${total} 条`);
+    } catch (e) {
+      toast.error(`同步失败：${(e as Error).message}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">测绘搜资产</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-wrap items-center gap-2">
+          {ENGINE_META.map((m) => (
+            <Button
+              key={m.key}
+              size="sm"
+              variant={engine === m.key ? "default" : "outline"}
+              onClick={() => setEngine(m.key)}
+            >
+              {m.label}
+              {status?.engines?.[m.key]?.configured ? "" : " *"}
+            </Button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant={mode === "syntax" ? "default" : "outline"} onClick={() => setMode("syntax")}>
+            查询语法
+          </Button>
+          <Button
+            size="sm"
+            variant={mode === "intent" ? "default" : "outline"}
+            onClick={() => {
+              if (!status?.llm_ready) return toast.error("LLM 未配置，无法使用意图模式");
+              setMode("intent");
+            }}
+          >
+            大白话意图（LLM 转写）
+          </Button>
+        </div>
+
+        <textarea
+          className="min-h-[72px] w-full rounded-md border bg-transparent px-3 py-2 text-sm"
+          rows={3}
+          placeholder={mode === "syntax" ? meta.placeholder : "例：帮我找教育行业的统一身份认证登录页"}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+
+        <div className="flex flex-wrap items-center gap-4">
+          <label className="flex items-center gap-1.5 text-sm">
+            最大翻页数
+            <Input
+              type="number"
+              min={1}
+              max={100}
+              value={maxPages}
+              onChange={(e) => setMaxPages(Math.max(1, Number(e.target.value) || 1))}
+              className="w-20"
+            />
+          </label>
+          <label htmlFor="eng-company" className="flex items-center gap-1.5 text-sm">
+            <Checkbox id="eng-company" checked={createCompany} onCheckedChange={(c) => setCreateCompany(!!c)} />
+            按主域建立企业并写入范围
+          </label>
+          <div className="flex-1" />
+          {!configured && <span className="text-amber-600 text-xs dark:text-amber-500">* 当前引擎未配置/未启用</span>}
+          <Button variant="outline" onClick={doSearch} disabled={searching || !configured}>
+            <SearchIcon className={searching ? "size-4 animate-pulse" : "size-4"} /> 预览搜索
+          </Button>
+          <Button onClick={doSync} disabled={syncing || !configured}>
+            <DownloadIcon className={syncing ? "size-4 animate-pulse" : "size-4"} /> 拉取并入库
+          </Button>
+        </div>
+
+        {resolvedQuery && (
+          <p className="text-muted-foreground text-xs">
+            实际查询语法：<code>{resolvedQuery}</code>
+          </p>
+        )}
+
+        {preview.length > 0 && (
+          <div className="max-h-72 overflow-auto rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>主机</TableHead>
+                  <TableHead>IP:端口</TableHead>
+                  <TableHead>标题</TableHead>
+                  <TableHead>组织</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {preview.map((a, i) => (
+                  <TableRow key={i}>
+                    <TableCell className="font-medium">{a.host || a.ip}</TableCell>
+                    <TableCell>{a.ip ? `${a.ip}:${a.port || ""}` : "—"}</TableCell>
+                    <TableCell className="max-w-48 truncate">{a.title || "—"}</TableCell>
+                    <TableCell>{a.org || "—"}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+
+        {result && <SyncResult result={result} />}
+      </CardContent>
+    </Card>
   );
 }

@@ -874,6 +874,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sync/scopesentry/projects", s.syncSSProjects)
 	mux.HandleFunc("GET /api/sync/scopesentry/tasks", s.syncSSTasks)
 	mux.HandleFunc("POST /api/sync/scopesentry/sync", s.syncSSRun)
+	// 资产同步 — 互联网测绘引擎（FOFA/Quake/Hunter/ZoomEye/Shodan/Censys）
+	mux.HandleFunc("GET /api/sync/engines/status", s.syncEnginesStatus)
+	mux.HandleFunc("POST /api/sync/engines/datasource", s.syncEnginesDatasource)
+	mux.HandleFunc("POST /api/sync/engines/search", s.syncEnginesSearch)
+	mux.HandleFunc("POST /api/sync/engines/sync", s.syncEnginesRun)
 	// Skill CRUD (文件系统)
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
