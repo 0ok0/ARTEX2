@@ -23,7 +23,7 @@ const engineHTTPTimeout = 60 * time.Second
 
 // engineAsset 是所有引擎归一化后的单条资产。
 type engineAsset struct {
-	Host    string `json:"host"`    // 主机（域名或 IP，FOFA 的 host 可能带协议/端口）
+	Host    string `json:"host"` // 主机（域名或 IP，FOFA 的 host 可能带协议/端口）
 	IP      string `json:"ip"`
 	Port    int    `json:"port"`
 	Title   string `json:"title"`
@@ -106,10 +106,10 @@ func (c *fofaClient) Fetch(ctx context.Context, query string, page, size int, _ 
 		return enginePage{}, err
 	}
 	var env struct {
-		Error   bool     `json:"error"`
-		ErrMsg  string   `json:"errmsg"`
-		Size    int64    `json:"size"`
-		Results [][]any  `json:"results"`
+		Error   bool    `json:"error"`
+		ErrMsg  string  `json:"errmsg"`
+		Size    int64   `json:"size"`
+		Results [][]any `json:"results"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
 		return enginePage{}, fmt.Errorf("fofa 解析失败: %w", err)
@@ -169,8 +169,8 @@ func (c *quakeClient) Fetch(ctx context.Context, query string, page, size int, _
 		return enginePage{}, err
 	}
 	var env struct {
-		Code    int             `json:"code"`
-		Message string          `json:"message"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
 		Data    []struct {
 			IP      string `json:"ip"`
 			Port    int    `json:"port"`
@@ -326,7 +326,7 @@ func (c *zoomeyeClient) Fetch(ctx context.Context, query string, page, size int,
 	}
 	// v2 返回 {total, list|matches: [...]}，字段容错解析。
 	var inner struct {
-		Total   int64           `json:"total"`
+		Total   int64             `json:"total"`
 		List    []json.RawMessage `json:"list"`
 		Matches []json.RawMessage `json:"matches"`
 	}
@@ -337,14 +337,14 @@ func (c *zoomeyeClient) Fetch(ctx context.Context, query string, page, size int,
 	rows := append(append([]json.RawMessage{}, inner.List...), inner.Matches...)
 	for _, raw := range rows {
 		var it struct {
-			IP   string `json:"ip"`
-			Port int    `json:"port"`
-			Domain string `json:"domain"`
-			Hostname string `json:"hostname"`
-			Title  string `json:"title"`
-			URL    string `json:"url"`
-			Organization any `json:"organization"`
-			Service any `json:"service"`
+			IP           string `json:"ip"`
+			Port         int    `json:"port"`
+			Domain       string `json:"domain"`
+			Hostname     string `json:"hostname"`
+			Title        string `json:"title"`
+			URL          string `json:"url"`
+			Organization any    `json:"organization"`
+			Service      any    `json:"service"`
 		}
 		if err := json.Unmarshal(raw, &it); err != nil {
 			continue
@@ -422,8 +422,8 @@ func (c *shodanClient) Fetch(ctx context.Context, query string, page, size int, 
 // censysClient 双模式：Key 形如 "API_ID:SECRET" 走 Legacy Search v2（Basic 鉴权）；
 // 否则视为个人令牌走 Platform v3（Bearer + CenQL，游标翻页）。
 type censysClient struct {
-	Key     string
-	HTTP    *http.Client
+	Key  string
+	HTTP *http.Client
 }
 
 func (c *censysClient) Fetch(ctx context.Context, query string, page, size int, cursor string) (enginePage, error) {
@@ -477,11 +477,11 @@ func (c *censysClient) fetchLegacy(ctx context.Context, query string, page, size
 		return enginePage{}, fmt.Errorf("HTTP %d: %.400s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	var env struct {
-		Code int `json:"code"`
+		Code   int `json:"code"`
 		Result struct {
-			Total   int64  `json:"total"`
-			Cursor  string `json:"cursor"`
-			Hits    []censysHit `json:"hits"`
+			Total  int64       `json:"total"`
+			Cursor string      `json:"cursor"`
+			Hits   []censysHit `json:"hits"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -495,18 +495,18 @@ func (c *censysClient) fetchLegacy(ctx context.Context, query string, page, size
 }
 
 type censysHit struct {
-	IP          string   `json:"ip"`
-	DNS         struct {
+	IP  string `json:"ip"`
+	DNS struct {
 		Names []string `json:"names"`
 	} `json:"dns"`
 	AutonomousSystem struct {
 		Organization string `json:"organization"`
 	} `json:"autonomous_system"`
 	Services []struct {
-		Port       int    `json:"port"`
-		Transport  string `json:"transport_protocol"`
+		Port        int    `json:"port"`
+		Transport   string `json:"transport_protocol"`
 		ServiceName string `json:"service_name"`
-		HTTP       struct {
+		HTTP        struct {
 			Response struct {
 				HTMLTitle string `json:"html_title"`
 			} `json:"response"`

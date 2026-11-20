@@ -23,10 +23,10 @@ import (
 )
 
 const (
-	settingEnginePrefix = "engine_"          // settings key 前缀: engine_fofa = JSON
-	engineSyncTimeout   = 10 * time.Minute   // 单次同步总预算
-	engineLLMTimeout    = 90 * time.Second   // 意图转语法超时
-	engineMaxTotal      = 10000              // 单次同步全引擎入库保护上限
+	settingEnginePrefix = "engine_"        // settings key 前缀: engine_fofa = JSON
+	engineSyncTimeout   = 10 * time.Minute // 单次同步总预算
+	engineLLMTimeout    = 90 * time.Second // 意图转语法超时
+	engineMaxTotal      = 10000            // 单次同步全引擎入库保护上限
 )
 
 // engineSetting 保存每个引擎的配置（settings 表里一段 JSON）。
@@ -139,9 +139,9 @@ func (s *Server) syncEnginesStatus(w http.ResponseWriter, r *http.Request) {
 // ---------- POST /api/sync/engines/datasource ----------
 
 type engineDatasourceReq struct {
-	Engine  string `json:"engine"`
-	Enabled *bool  `json:"enabled"` // nil = 不改
-	Key     *string `json:"key"`    // nil = 不改；指针空串 = 清除
+	Engine  string  `json:"engine"`
+	Enabled *bool   `json:"enabled"` // nil = 不改
+	Key     *string `json:"key"`     // nil = 不改；指针空串 = 清除
 	BaseURL *string `json:"base_url"`
 }
 
@@ -252,11 +252,11 @@ func (s *Server) resolveEngineQuery(ctx context.Context, engine, query string, i
 		"你是测绘引擎查询语法专家。把下面的大白话需求转写为 %s 引擎的官网查询语法（只输出语法本身，不要解释、不要引号包裹、不要 markdown）。\n"+
 			"语法要求遵循该引擎官方文档；如果需求无法表达为语法，就给出最接近的保守语法。\n\n需求：%s", engine, query)
 	reqMsg := llm.CompletionRequest{
-		System:     []string{"You translate natural-language recon requirements into search-engine query syntax. Output only the query."},
-		Messages:   []llm.Message{llm.UserText(prompt)},
-		MaxTokens:  512,
+		System:      []string{"You translate natural-language recon requirements into search-engine query syntax. Output only the query."},
+		Messages:    []llm.Message{llm.UserText(prompt)},
+		MaxTokens:   512,
 		Temperature: floatPtr(0.2),
-		Thinking:   "disabled",
+		Thinking:    "disabled",
 	}
 	msg, _, _, err := prov.Complete(lctx, reqMsg)
 	if err != nil {

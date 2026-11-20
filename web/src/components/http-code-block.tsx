@@ -111,7 +111,7 @@ function HighlightedBody({ body, format }: { body: string; format: BodyFormat })
   return body;
 }
 
-export function HttpCodeBlock({ raw }: { raw: string }) {
+export function HttpCodeBlock({ raw, className }: { raw: string; className?: string }) {
   const [wrapLines, setWrapLines] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
   const value = raw || "（空）";
@@ -182,7 +182,10 @@ export function HttpCodeBlock({ raw }: { raw: string }) {
         aria-multiline="true"
         aria-readonly="true"
         tabIndex={0}
-        className="max-h-[calc(100vh-15rem)] min-w-0 overflow-auto bg-background py-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className={cn(
+          "min-w-0 overflow-auto bg-background py-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          className ?? "max-h-[calc(100vh-15rem)]",
+        )}
         onKeyDown={(event) => {
           if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "a") return;
           event.preventDefault();

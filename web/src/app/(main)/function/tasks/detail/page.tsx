@@ -5,10 +5,11 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
+import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PencilIcon, PauseIcon, PlayIcon, RotateCcwIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
+import { TaskFormSheet } from "@/components/task-form-sheet";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
@@ -213,6 +214,8 @@ function TaskDetailInner() {
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
+  const [editOpen, setEditOpen] = React.useState(false);
+  const [rerunning, setRerunning] = React.useState(false);
 
   React.useEffect(() => {
     api
@@ -284,6 +287,20 @@ function TaskDetailInner() {
       toast.success(next ? "已暂停探索" : "已恢复探索");
     } catch (e) {
       toast.error("操作失败：" + (e as Error).message);
+    }
+  }
+
+  async function rerun() {
+    if (!task || rerunning) return;
+    setRerunning(true);
+    try {
+      const r = await api.rerunTask(task.id);
+      toast.success(r.queued ? `任务 #${task.id} 已重新进行，当前并发已满、进入队列` : `任务 #${task.id} 已重新进行`);
+      load();
+    } catch (e) {
+      toast.error(`重新进行失败：${(e as Error).message}`);
+    } finally {
+      setRerunning(false);
     }
   }
 
@@ -392,6 +409,15 @@ function TaskDetailInner() {
               <TooltipContent>{archiveDisabledReason}</TooltipContent>
             </Tooltip>
           )}
+          <Button size="icon-sm" variant="ghost" aria-label="编辑任务" title="编辑任务" onClick={() => setEditOpen(true)}>
+            <PencilIcon />
+          </Button>
+          {terminal && (
+            <Button size="sm" variant="outline" onClick={rerun} disabled={rerunning} title="按当前任务定义重新执行（保留图谱/资产/目标）">
+              {rerunning ? <Spinner data-icon="inline-start" /> : <RotateCcwIcon data-icon="inline-start" />}
+              重新进行
+            </Button>
+          )}
           <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
             {controlIcon}
             {controlLabel}
@@ -448,6 +474,19 @@ function TaskDetailInner() {
           <ReportTab taskId={id} />
         </TabsContent>
       </div>
+      {editOpen && task && (
+        <TaskFormSheet
+          mode="edit"
+          editTask={task}
+          open={editOpen}
+          onOpenChange={(o) => {
+            if (!o) setEditOpen(false);
+          }}
+          onSaved={() => {
+            load();
+          }}
+        />
+      )}
     </Tabs>
   );
 }

@@ -527,6 +527,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
+    scheduled_at   TIMESTAMPTZ,
     archived_at    TIMESTAMPTZ,
     deleted_at     TIMESTAMPTZ,
     completed_at   TIMESTAMPTZ,
@@ -540,6 +541,8 @@ CREATE TRIGGER trg_tasks_upd BEFORE UPDATE ON tasks
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 -- planner 心跳触发间隔(秒);补旧库。默认 300s(5min)。见 docs/planner-trigger-impl-plan.md
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300;
+-- 定时执行;补旧库。非 NULL 且 status='created' 表示等待到点自动启动(见 server taskScheduleLoop)。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
 -- 并发上限挂起态;补旧库。true=因并发上限排队、等待空位自动启动。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false;
 -- 资产覆盖度功能开关;补旧库。true(默认)=计算/展示测试覆盖度、自动累积测试范围、
@@ -1384,3 +1387,71 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- =====================================================================
+-- SRC 漏洞提交（补天 / EDU-SRC）
+--   src_vendors           厂商档案(资产范围/行业/地区/权重预置)
+--   finding_submissions   提交记录(冻结表单 + 材料清单 + 状态跟踪)
+-- 设计要点：表单在「生成」时冻结成 JSONB。平台审核周期长，期间 finding 可能被
+-- 改名/复测/改状态；冻结快照保证「当时提交的原文」可回溯，也避免重复提交时
+-- 拿新数据覆盖旧单。
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS src_vendors (
+    id          BIGSERIAL PRIMARY KEY,
+    -- butian 补天 / edusrc 教育行业漏洞报告平台。取值由 server 侧白名单校验。
+    platform    TEXT NOT NULL DEFAULT 'butian',
+    name        TEXT NOT NULL,
+    domain      TEXT NOT NULL DEFAULT '',
+    root_domain TEXT NOT NULL DEFAULT '',
+    -- 可测资产范围：["example.com","*.example.com","1.2.3.0/24"]；空 = 未登记，预审给警告
+    scope       JSONB NOT NULL DEFAULT '[]',
+    industry    TEXT NOT NULL DEFAULT '',
+    region      TEXT NOT NULL DEFAULT '',
+    -- 补天「漏洞权重」是人工判断(爱站权重)；档案里预置一次，生成表单时直接带出
+    weight_zero BOOLEAN NOT NULL DEFAULT true,
+    contact     TEXT NOT NULL DEFAULT '',
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_src_vendors_platform ON src_vendors(platform, enabled, name);
+DROP TRIGGER IF EXISTS trg_src_vendors_upd ON src_vendors;
+CREATE TRIGGER trg_src_vendors_upd BEFORE UPDATE ON src_vendors
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS finding_submissions (
+    id          BIGSERIAL PRIMARY KEY,
+    finding_id  BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    vendor_id   BIGINT REFERENCES src_vendors(id) ON DELETE SET NULL,
+    platform    TEXT NOT NULL DEFAULT 'butian',
+    -- draft 预审未过 / ready 材料就绪待提交 / submitting 浏览器填表中 /
+    -- submitted 已提交待审核 / accepted 通过 / rejected 驳回 / duplicate 重复 /
+    -- withdrawn 撤回 / superseded 被新版本替代。取值由 server 侧白名单校验。
+    state       TEXT NOT NULL DEFAULT 'draft',
+    -- 平台侧单号，人工回填后用于跟踪审核结果
+    external_id TEXT NOT NULL DEFAULT '',
+    -- 生成时的表单快照(平台字段 key -> 值)，冻结不改
+    form        JSONB NOT NULL DEFAULT '{}',
+    -- 材料清单 [{name,bytes,sha256}]，文件落在 data/submissions/<id>/ 下
+    materials   JSONB NOT NULL DEFAULT '[]',
+    -- 预审阻断项/警告项快照
+    blockers    JSONB NOT NULL DEFAULT '[]',
+    warnings    JSONB NOT NULL DEFAULT '[]',
+    note        TEXT NOT NULL DEFAULT '',
+    submitted_at TIMESTAMPTZ,
+    reviewed_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_submissions_finding
+    ON finding_submissions(finding_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_finding_submissions_state
+    ON finding_submissions(state, id DESC);
+-- 同一漏洞对同一厂商同一平台最多一条「进行中」记录：防止重复提交(补天严禁多投)。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_submissions_open
+    ON finding_submissions(finding_id, platform, COALESCE(vendor_id, 0))
+    WHERE state IN ('draft','ready','submitting','submitted');
+DROP TRIGGER IF EXISTS trg_finding_submissions_upd ON finding_submissions;
+CREATE TRIGGER trg_finding_submissions_upd BEFORE UPDATE ON finding_submissions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

@@ -5,6 +5,7 @@
 package traffic
 
 import (
+	"compress/gzip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -102,6 +103,12 @@ const (
 	// maxBlobRead caps one traffic_blob read so paging through a large body never
 	// floods the agent's context.
 	maxBlobRead = 8 * 1024
+	// replayMaxBody caps one replay response read. A replay is for comparing
+	// evidence, not for pulling whole files; anything larger ends with a note.
+	replayMaxBody = 8 * 1024 * 1024
+	// replayTimeout bounds one replayed exchange. Long-poll targets would
+	// otherwise hold the operator's UI open for as long as the target likes.
+	replayTimeout = 60 * time.Second
 	// autoVacuumIncremental is SQLite's numeric value for auto_vacuum=incremental.
 	autoVacuumIncremental = 2
 	// reclaimChunkPages bounds how much index space one locked step returns to the
@@ -972,6 +979,154 @@ FROM exchange_bodies b JOIN exchanges e ON e.id=b.id WHERE b.id=?`, id).
 	rb, _ := os.ReadFile(filepath.Join(t.dir, rel, "request.http"))
 	pb, _ := os.ReadFile(filepath.Join(t.dir, rel, "response.http"))
 	return string(rb), string(pb), nil
+}
+
+// Replay re-issues one stored exchange against its original target and returns
+// the raw request actually sent plus the raw response received. Redirects are
+// not followed: a replay is for evidence comparison, and the first response is
+// the datum. The replayed exchange is not recorded — it exists for the
+// operator's eyes, not the index.
+var blobPtrRe = regexp.MustCompile(`\n…\[truncated\] @blob sha256:([0-9a-f]{64}) \(len=(\d+)\)\s*$`)
+
+// ReplayRaw 把调用方给到的原始请求报文（可编辑后的）按原目标重发，返回实际
+// 发出的请求原文与新响应。报文里的 blob 截断指针会自动还原为完整正文。
+// 重定向不跟随：重放是为比对证据，第一个响应才是要看的。重放不写入流量索引。
+func (t *Traffic) ReplayRaw(scheme, raw string) (req, resp string, err error) {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	sep := strings.Index(raw, "\n\n")
+	if sep < 0 {
+		sep = len(raw)
+	}
+	head, body := raw[:sep], ""
+	if sep+2 <= len(raw) {
+		body = raw[sep+2:]
+	}
+	// blob 截断指针 → 还原完整正文（头部之后的所有内容）
+	if m := blobPtrRe.FindStringSubmatch(body); m != nil {
+		if data, _, blobErr := t.BlobRange(m[1], 0, int64(replayMaxBody)); blobErr == nil {
+			body = string(data)
+		}
+	}
+	lines := strings.Split(head, "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return "", "", fmt.Errorf("请求报文为空")
+	}
+	line0 := strings.TrimRight(lines[0], "\r")
+	parts := strings.SplitN(line0, " ", 3)
+	if len(parts) < 2 {
+		return "", "", fmt.Errorf("请求行无法解析: %q", line0)
+	}
+	method, path := parts[0], parts[1]
+	target := scheme + "://" + hostHeaderOf(lines) + path
+	if hostHeaderOf(lines) == "" {
+		return "", "", fmt.Errorf("请求缺少 Host 头")
+	}
+	req2, err := http.NewRequest(method, target, strings.NewReader(body))
+	if err != nil {
+		return "", "", fmt.Errorf("重建请求失败: %w", err)
+	}
+	for _, ln := range lines[1:] {
+		ln = strings.TrimRight(ln, "\r")
+		if ln == "" {
+			continue
+		}
+		i := strings.Index(ln, ":")
+		if i <= 0 {
+			continue
+		}
+		key, val := ln[:i], strings.TrimSpace(ln[i+1:])
+		switch http.CanonicalHeaderKey(key) {
+		case "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailer", "Transfer-Encoding", "Upgrade", "Content-Length",
+			"Host", "Accept-Encoding":
+			continue
+		}
+		req2.Header.Add(key, val)
+	}
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       replayTimeout,
+	}
+	hresp, err := client.Do(req2)
+	if err != nil {
+		return "", "", fmt.Errorf("重放请求失败: %w", err)
+	}
+	defer hresp.Body.Close()
+	bodyBytes, readErr := io.ReadAll(io.LimitReader(hresp.Body, replayMaxBody))
+	truncated := readErr != nil
+	if hresp.Header.Get("Content-Encoding") == "gzip" {
+		if zr, gzErr := gzip.NewReader(bytes.NewReader(bodyBytes)); gzErr == nil {
+			if plain, gzErr2 := io.ReadAll(io.LimitReader(zr, replayMaxBody)); gzErr2 == nil {
+				bodyBytes = plain
+			}
+		}
+	}
+
+	var rq strings.Builder
+	fmt.Fprintf(&rq, "%s %s HTTP/1.1\n", method, req2.URL.RequestURI())
+	fmt.Fprintf(&rq, "Host: %s\n", req2.URL.Host)
+	reqKeys := make([]string, 0, len(req2.Header))
+	for k := range req2.Header {
+		reqKeys = append(reqKeys, k)
+	}
+	sort.Strings(reqKeys)
+	for _, k := range reqKeys {
+		for _, v := range req2.Header[k] {
+			fmt.Fprintf(&rq, "%s: %s\n", k, v)
+		}
+	}
+	rq.WriteString("\n")
+	rq.WriteString(body)
+	req = rq.String()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP/1.1 %s\n", hresp.Status)
+	respKeys := make([]string, 0, len(hresp.Header))
+	for k := range hresp.Header {
+		respKeys = append(respKeys, k)
+	}
+	sort.Strings(respKeys)
+	for _, k := range respKeys {
+		for _, v := range hresp.Header[k] {
+			fmt.Fprintf(&b, "%s: %s\n", k, v)
+		}
+	}
+	b.WriteString("\n")
+	b.Write(bodyBytes)
+	if truncated {
+		fmt.Fprintf(&b, "\n…[truncated] 响应超过 %d MB 截断", replayMaxBody/(1024*1024))
+	}
+	resp = b.String()
+	return req, resp, nil
+}
+
+func hostHeaderOf(lines []string) string {
+	for _, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if i := strings.Index(ln, ":"); i > 0 && strings.EqualFold(ln[:i], "Host") {
+			return strings.TrimSpace(ln[i+1:])
+		}
+	}
+	return ""
+}
+
+// Replay(id) 取存储的原始请求报文，按其原始协议委托 ReplayRaw 重发。
+// Replay(id) 取存储的原始请求报文，按其原始协议委托 ReplayRaw 重发。
+func (t *Traffic) Replay(id string) (req, resp string, err error) {
+	var raw, urlStr string
+	if _, raw, err = t.Get(id); err != nil {
+		return "", "", err
+	}
+	err = t.db.QueryRow(`SELECT url FROM exchanges WHERE id=?`, id).Scan(&urlStr)
+	if err != nil {
+		return "", "", err
+	}
+	scheme := "http"
+	if u, parseErr := url.Parse(urlStr); parseErr == nil && u.Scheme != "" {
+		scheme = u.Scheme
+	}
+	return t.ReplayRaw(scheme, raw)
 }
 
 // assembleRaw rebuilds one side's raw HTTP text: head, blank line, body. A body

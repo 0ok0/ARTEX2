@@ -39,6 +39,9 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  scheduled_at?: string; // 定时执行时刻 RFC3339;缺省=未排程(仅"已创建"状态任务可能带排程)
+  timeout_seconds?: number; // 任务级超时(秒);0/缺省=不限时
+  plan_heartbeat_seconds?: number; // planner 心跳触发间隔(秒)
 }
 
 export interface TaskCategory {
@@ -1201,6 +1204,136 @@ export interface SkillItem {
   tasks: number; // 加载过它的任务数（chat 会话不计入）
   usage_agents: string[]; // 加载过它的 agent key
   last_used?: string;
+}
+
+// ---- SRC 漏洞提交（补天 / EDU-SRC） ----
+// 表单在「生成」时冻结成快照，之后 finding 变更不影响已生成记录。
+
+export type SrcPlatform = "butian" | "edusrc";
+
+export type SrcFieldKind =
+  | "text"
+  | "textarea"
+  | "richtext"
+  | "select"
+  | "urls"
+  | "files"
+  | "checkbox";
+
+export interface SrcFieldDef {
+  Key: string;
+  Label: string;
+  Required: boolean;
+  Kind: SrcFieldKind;
+  Hint: string;
+  Options: string[] | null;
+}
+
+export interface SrcPlatformDef {
+  Platform: SrcPlatform;
+  Name: string;
+  SubmitURL: string;
+  LoginURL: string;
+  AssetScope: string;
+  Fields: SrcFieldDef[];
+  ExtraBlockers: string[] | null;
+}
+
+export interface SrcFormItem {
+  key: string;
+  label: string;
+  kind: SrcFieldKind;
+  value: string;
+  options?: string[];
+  hint?: string;
+  source: string;
+  locked?: boolean;
+}
+
+export interface SrcBlocker {
+  code: string;
+  level: "block" | "warn";
+  message: string;
+  field?: string;
+}
+
+export interface SrcVendor {
+  id: number;
+  platform: SrcPlatform;
+  name: string;
+  domain: string;
+  root_domain: string;
+  scope: string[];
+  industry: string;
+  region: string;
+  weight_zero: boolean;
+  contact: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export type SrcSubmissionState =
+  | "draft"
+  | "ready"
+  | "submitting"
+  | "submitted"
+  | "accepted"
+  | "rejected"
+  | "duplicate"
+  | "withdrawn"
+  | "superseded";
+
+export interface SrcMaterial {
+  name: string;
+  bytes: number;
+  sha256: string;
+}
+
+export interface SrcSubmission {
+  id: number;
+  finding_id: number;
+  vendor_id?: number;
+  platform: SrcPlatform;
+  state: SrcSubmissionState;
+  external_id: string;
+  form: Record<string, string>;
+  materials: SrcMaterial[];
+  blockers: SrcBlocker[];
+  warnings: SrcBlocker[];
+  note: string;
+  submitted_at?: string;
+  reviewed_at?: string;
+  created_at: string;
+  updated_at: string;
+  vendor_name?: string;
+  finding_title?: string;
+  finding_severity?: string;
+}
+
+// 预审 + 生成的返回体（save=false 时是纯预览，没有 submission）。
+export interface SrcSubmitResult {
+  submission?: SrcSubmission;
+  ready: boolean;
+  form: SrcFormItem[];
+  brief: string;
+  detail: string;
+  blockers: SrcBlocker[];
+  warnings: SrcBlocker[];
+  definition?: SrcPlatformDef;
+  material_error?: string;
+}
+
+export interface SrcFillResult {
+  url: string;
+  title: string;
+  filled: string[];
+  missing: string[];
+  failed: { key: string; reason: string }[];
+  warnings: string[];
+  logged_in: boolean;
+  /** 写入到富文本编辑器（UEditor/KindEditor）的字段 key。 */
+  richtext?: string[];
 }
 
 // SkillCall 是一次 Skill() 调用（单个 skill 的最近调用列表）。

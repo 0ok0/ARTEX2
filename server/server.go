@@ -119,7 +119,11 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
 }
+
+// Close releases process-scoped resources owned by the Server.
+func (s *Server) Close() {}
 
 // provEntry is a cached provider + its config for one LLM profile id.
 type provEntry struct {
@@ -254,6 +258,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	}
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
+	go s.taskScheduleLoop(s.ctx) // 定时执行:每 30s 认领到期的 scheduled_at 任务并自动启动(重启后续接)
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
@@ -683,6 +688,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/task-templates/{id}", s.pgDeleteTaskTemplate)
 	mux.HandleFunc("GET /api/tasks/{id}", s.getTask)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.updateTaskMetadata)
+	mux.HandleFunc("PUT /api/tasks/{id}/edit", s.editTask)
+	mux.HandleFunc("POST /api/tasks/{id}/rerun", s.rerunTask)
 	mux.HandleFunc("PATCH /api/tasks/{id}/category", s.updateTaskCategory)
 	// 任务级资产拦截/允许规则
 	mux.HandleFunc("GET /api/tasks/{id}/intercept-rules", s.taskInterceptListRules)
@@ -790,6 +797,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
+	mux.HandleFunc("POST /api/traffic/replay", s.replayTraffic)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
@@ -1129,8 +1137,32 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if req.Action != "pause" && req.Action != "resume" {
-		writeErr(w, 400, "action must be pause|resume")
+	if req.Action != "pause" && req.Action != "resume" && req.Action != "start" {
+		writeErr(w, 400, "action must be pause|resume|start")
+		return
+	}
+	if req.Action == "start" {
+		// 启动一个尚未运行的任务(run_mode=never 创建后停在 created；或 scheduled 排程中提前启动)。
+		// 启动即清除排程(如未到期)并走与创建时一致的建后流程。
+		lifecycle := t.lifecycleSnapshot()
+		if lifecycle.Status != "created" {
+			writeErr(w, 409, "仅「已创建(未启动)」状态的任务可以启动；运行中任务请使用 resume，终态任务请重新创建")
+			return
+		}
+		if s.engine.IsDeleting(t.ID) {
+			writeErr(w, 409, "任务正在删除")
+			return
+		}
+		if lifecycle.ScheduledAt > 0 {
+			if err := s.m.pg.SetTaskScheduled(t.int64ID(), nil); err != nil {
+				writeErr(w, 500, "清除定时计划失败："+err.Error())
+				return
+			}
+		}
+		t.updateLifecycle(func(state *taskLifecycleState) { state.ScheduledAt = 0 })
+		log.Printf("[task] #%s 手动启动(此前状态: created)", t.ID)
+		go s.launchTask(t, t.Description+" "+t.Goal, false)
+		writeJSON(w, 200, map[string]any{"id": t.ID, "status": "running"})
 		return
 	}
 	result, err := s.applyTaskControl(t, req.Action)
@@ -1462,6 +1494,10 @@ type createTaskReq struct {
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	// RunMode 执行方式：immediate(默认/省略)=创建即启动(现状);never=仅创建不启动(用户手动启动);
+	// scheduled=到 scheduled_at 时刻由服务端调度循环自动启动。
+	RunMode     string `json:"run_mode,omitempty"`
+	ScheduledAt string `json:"scheduled_at,omitempty"` // RFC3339;run_mode=scheduled 时必填且必须晚于当前时刻
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1533,10 +1569,94 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
-	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
-	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
-	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
+	// 执行方式：immediate(默认)=创建即启动(与 spawn_task 共享建后流程);never=仅创建不启动,
+	// 任务停在 created 状态等用户手动启动;scheduled=写排程时刻,由 taskScheduleLoop 到点自动启动。
+	runMode := strings.ToLower(strings.TrimSpace(req.RunMode))
+	switch runMode {
+	case "", "immediate":
+		// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
+		// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
+		s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
+	case "never":
+		log.Printf("[task] #%s 创建后暂不执行(run_mode=never)，等待手动启动", t.ID)
+	case "scheduled":
+		at, err := time.Parse(time.RFC3339, strings.TrimSpace(req.ScheduledAt))
+		if err != nil {
+			writeErr(w, 400, "scheduled_at 无效：需要 RFC3339 格式(如 2026-11-17T15:00:00+08:00)")
+			return
+		}
+		if !at.After(time.Now()) {
+			writeErr(w, 400, "scheduled_at 必须晚于当前时刻")
+			return
+		}
+		if err := s.m.pg.SetTaskScheduled(t.int64ID(), &at); err != nil {
+			writeErr(w, 500, "写入定时计划失败："+err.Error())
+			return
+		}
+		t.updateLifecycle(func(state *taskLifecycleState) { state.ScheduledAt = at.Unix() })
+		log.Printf("[task] #%s 已排程 %s 自动启动(run_mode=scheduled)", t.ID, at.Format("2006-01-02 15:04:05 MST"))
+	default:
+		writeErr(w, 400, "run_mode 必须是 immediate|never|scheduled")
+		return
+	}
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+}
+
+// int64ID returns the task's numeric id (Task.ID is a decimal string).
+func (t *Task) int64ID() int64 {
+	id, _ := strconv.ParseInt(t.ID, 10, 64)
+	return id
+}
+
+// taskScheduleLoop 每 30s 原子认领一次到期的定时任务(status='created' 且 scheduled_at<=now)
+// 并启动它们。轮询 DB 而不是内存 timer：重启后无需恢复逻辑，天然续接所有未到期排程。
+func (s *Server) taskScheduleLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		// LLM 未就绪时不认领（保留 scheduled_at），到点任务留在排程里等配置恢复后自动启动；
+		// 否则认领后 admission 会静默卡住，任务既没排程也没运行。
+		if !s.engineReadyForScheduling() {
+			continue
+		}
+		ids, err := s.m.pg.ClaimDueScheduledTasks(time.Now())
+		if err != nil {
+			log.Printf("[task-schedule] 认领到期任务失败: %v", err)
+			continue
+		}
+		for _, id := range ids {
+			sid := strconv.FormatInt(id, 10)
+			t, ok := s.m.Task(sid)
+			if !ok {
+				log.Printf("[task-schedule] 到期任务 #%s 不在内存，跳过", sid)
+				continue
+			}
+			log.Printf("[task-schedule] #%s 到点自动启动", sid)
+			t.updateLifecycle(func(state *taskLifecycleState) { state.ScheduledAt = 0 }) // DB 已由 Claim 清空,内存同步
+			go s.launchTask(t, t.Description+" "+t.Goal, false)
+		}
+	}
+}
+
+// engineReadyForScheduling reports whether admission could actually start work now:
+// at least one LLM profile exists AND one is activated. Per-task chain failures are
+// checked by engine.ReadyFor inside the per-task path; this gate only avoids
+// claiming due schedules into an idle engine.
+func (s *Server) engineReadyForScheduling() bool {
+	if s.m.pg == nil {
+		return false
+	}
+	profiles, err := s.m.pg.ListProfiles()
+	if err != nil || len(profiles) == 0 {
+		return false
+	}
+	active, err := s.m.pg.ActiveProfile()
+	return err == nil && active != nil
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -3232,6 +3352,46 @@ func (s *Server) deleteAllTraffic(w http.ResponseWriter, r *http.Request) {
 
 // getTrafficExchange returns the full raw request/response of one exchange,
 // read on demand from the traffic tree (bodies are not in the paged list).
+// replayTraffic re-issues one stored exchange against its original target.
+// The replayed exchange is not recorded; the operator compares responses in the
+// UI, and the human confirms what the comparison means.
+func (s *Server) replayTraffic(w http.ResponseWriter, r *http.Request) {
+	tr := s.m.Traffic()
+	if tr == nil {
+		writeErr(w, 404, "traffic disabled")
+		return
+	}
+	var in struct {
+		ID     string `json:"id"`
+		Req    string `json:"req"`
+		Scheme string `json:"scheme"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, 400, "bad body")
+		return
+	}
+	var req, resp string
+	var err error
+	if raw := strings.TrimSpace(in.Req); raw != "" {
+		// 可编辑重放：调用方直接给原始请求报文（可已人工修改）。
+		scheme := in.Scheme
+		if scheme != "http" && scheme != "https" {
+			scheme = "https"
+		}
+		req, resp, err = tr.ReplayRaw(scheme, raw)
+	} else if strings.TrimSpace(in.ID) != "" {
+		req, resp, err = tr.Replay(strings.TrimSpace(in.ID))
+	} else {
+		writeErr(w, 400, "missing id or req")
+		return
+	}
+	if err != nil {
+		writeErr(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"req": req, "resp": resp})
+}
+
 func (s *Server) getTrafficExchange(w http.ResponseWriter, r *http.Request) {
 	tr := s.m.Traffic()
 	if tr == nil {

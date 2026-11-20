@@ -5,11 +5,12 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
+import { ArrowLeftIcon, ArrowUpRightIcon, SendIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
+import { FindingSubmitSkillDialog } from "@/components/finding-submit-skill-dialog";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
 import { Markdown } from "@/components/markdown";
 import { StatusBadge } from "@/components/status-badge";
@@ -61,6 +62,7 @@ function FindingDetailInner() {
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
+  const [submitSkillOpen, setSubmitSkillOpen] = React.useState(false);
 
   const load = React.useCallback(() => {
     if (!id) {
@@ -149,6 +151,15 @@ function FindingDetailInner() {
           <StatusBadge domain="finding" value={finding.status} dot />
           {finding.inherited && finding.source_task_id && (
             <Badge variant="outline">来源任务 #{finding.source_task_id} · 只读</Badge>
+          )}
+          {/* 提交到补天：继承来源任务的只读漏洞不允许投递（归属与复现责任在来源任务）。 */}
+          {!finding.inherited && finding.finding_id && (
+            <div className="ml-auto">
+              <Button size="sm" variant="outline" onClick={() => setSubmitSkillOpen(true)} title="用 butian-submit skill 发起提交会话">
+                <SendIcon data-icon="inline-start" />
+                提交到补天
+              </Button>
+            </div>
           )}
         </div>
         <TabsList>
@@ -329,6 +340,13 @@ function FindingDetailInner() {
         <TabsContent value="lineage" className="mt-0">
           <FindingLineageView findingId={finding.id} />
         </TabsContent>
+        {submitSkillOpen && finding.finding_id && (
+          <FindingSubmitSkillDialog
+            findingId={finding.finding_id}
+            findingName={finding.name || finding.vulnclass}
+            onClose={() => setSubmitSkillOpen(false)}
+          />
+        )}
       </div>
     </Tabs>
   );

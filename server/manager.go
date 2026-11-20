@@ -60,6 +60,7 @@ type Task struct {
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
+	ScheduledAt          int64                  `json:"scheduled_at,omitempty"` // 定时执行时刻(unix 秒,0=未排程);仅 created 任务带排程,到点由调度循环自动启动
 	Store                *pgdb.ExplorationStore `json:"-"`
 	Guard                *guard.Guard           `json:"-"`
 	notify               chan struct{}
@@ -88,6 +89,7 @@ type taskLifecycleState struct {
 	CompletedAt   int64
 	FirstRunAt    int64
 	DeadlineAt    int64
+	ScheduledAt   int64
 	SourceTaskIDs []int64
 	CompanyIDs    []int64
 	CategoryID    *int64
@@ -115,6 +117,7 @@ func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 		CompletedAt:   t.CompletedAt,
 		FirstRunAt:    t.FirstRunAt,
 		DeadlineAt:    t.DeadlineAt,
+		ScheduledAt:   t.ScheduledAt,
 		SourceTaskIDs: append([]int64(nil), t.SourceTaskIDs...),
 		CompanyIDs:    append([]int64(nil), t.CompanyIDs...),
 		CategoryID:    cloneInt64Ptr(t.CategoryID),
@@ -139,6 +142,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CompletedAt = state.CompletedAt
 	t.FirstRunAt = state.FirstRunAt
 	t.DeadlineAt = state.DeadlineAt
+	t.ScheduledAt = state.ScheduledAt
 	t.SourceTaskIDs = append(t.SourceTaskIDs[:0], state.SourceTaskIDs...)
 	t.CompanyIDs = append(t.CompanyIDs[:0], state.CompanyIDs...)
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
@@ -846,7 +850,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		ScheduledAt: unixOrZero(pt.ScheduledAt),
+		Store:       store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
 }
 
@@ -873,6 +878,50 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 		state.Name = updated.Name
 		state.PinnedAt = unixOrZero(updated.PinnedAt)
 	})
+	return task, nil
+}
+
+// UpdateTaskCore edits the task's defining fields (描述/目标/分类/超时/心跳/覆盖度)
+// and syncs the in-memory Task so DTOs and后续 planner 轮次看到的是新值。调用方负责
+// 状态约束（server 侧 editTask handler）。
+func (m *Manager) UpdateTaskCore(taskID string, patch pgdb.TaskCorePatch) (*Task, error) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, nil
+	}
+	updated, err := m.pg.UpdateTaskCore(id, patch)
+	if err != nil || updated == nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	task := m.tasks[taskID]
+	m.mu.RUnlock()
+	if task == nil {
+		return nil, nil
+	}
+	task.updateLifecycle(func(state *taskLifecycleState) {
+		state.Name = updated.Name
+		if patch.CategoryID != nil {
+			state.CategoryID = cloneInt64Ptr(updated.CategoryID)
+			// taskCols 不含 category_name（列表走 hydrate），这里按新 id 现查，避免把内存名清空。
+			if updated.CategoryID != nil {
+				if cat, err := m.pg.GetTaskCategory(*updated.CategoryID); err == nil && cat != nil {
+					state.CategoryName = cat.Name
+				} else {
+					state.CategoryName = ""
+				}
+			} else {
+				state.CategoryName = ""
+			}
+		}
+	})
+	task.Description = updated.Description
+	task.Goal = updated.Goal
+	task.TimeoutSeconds = updated.TimeoutSeconds
+	task.PlanHeartbeatSeconds = updated.PlanHeartbeatSeconds
+	task.CoverageEnabled = updated.CoverageEnabled
 	return task, nil
 }
 

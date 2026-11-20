@@ -11,9 +11,12 @@ import {
   FilterXIcon,
   ListChecksIcon,
   Loader2Icon,
+  PlayIcon,
   RadioTowerIcon,
   SearchIcon,
+  SlidersHorizontalIcon,
   Trash2Icon,
+  XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -36,10 +39,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { SortableHead } from "@/components/ui/sortable-head";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import { useStoredSortPreference } from "@/lib/sort-preference";
@@ -140,6 +141,12 @@ export default function TrafficPage() {
   const [selected, setSelected] = React.useState<TrafficExchange | null>(null);
   const [detail, setDetail] = React.useState<TrafficDetail | null>(null);
   const [detailLoading, setDetailLoading] = React.useState(false);
+  const [replay, setReplay] = React.useState<{ req: string; resp: string; ms: number } | null>(null);
+  const [replayLoading, setReplayLoading] = React.useState(false);
+  const [editedReq, setEditedReq] = React.useState<string>("");
+  const [showReplayResp, setShowReplayResp] = React.useState(false);
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
+  const [listH, setListH] = React.useState(340);
 
   const [hosts, setHosts] = React.useState<TrafficHost[]>([]); // target picker
   const [selectedHosts, setSelectedHosts] = React.useState<string[]>([]); // checked in picker
@@ -299,6 +306,7 @@ export default function TrafficPage() {
 
   // Lazy-load the raw request/response for the selected exchange.
   React.useEffect(() => {
+    setReplay(null);
     if (!selected) {
       setDetail(null);
       return;
@@ -309,7 +317,10 @@ export default function TrafficPage() {
     api
       .trafficExchange(selected.id)
       .then((d) => {
-        if (alive) setDetail(d);
+        if (alive) {
+          setDetail(d);
+          setEditedReq(requestWithHost(d.req, selected));
+        }
       })
       .catch(() => {
         if (alive) setDetail({ req: "（无法加载报文）", resp: "" });
@@ -337,12 +348,46 @@ export default function TrafficPage() {
   const rangeStart = total === 0 ? 0 : page * size + 1;
   const rangeEnd = page * size + exchanges.length;
 
+  async function doReplay() {
+    if (!selected || replayLoading) return;
+    setReplayLoading(true);
+    const started = Date.now();
+    const scheme = selected.url.startsWith("https") ? "https" : "http";
+    try {
+      const d = await api.trafficReplay({ req: editedReq, scheme });
+      setReplay({ req: d.req, resp: d.resp, ms: Date.now() - started });
+    } catch {
+      setReplay({
+        req: "",
+        resp: "（重放失败——目标不可达、流量记录已过期或请求体超出重放上限）",
+        ms: Date.now() - started,
+      });
+      setShowReplayResp(true);
+    } finally {
+      setReplayLoading(false);
+    }
+  }
+
+  function startListDrag(e: React.MouseEvent) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = listH;
+    const onMove = (ev: MouseEvent) =>
+      setListH(Math.min(Math.max(140, startH + (ev.clientY - startY)), window.innerHeight - 220));
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
+    <div className="flex min-h-0 flex-1 flex-col gap-2">
       <div className="flex items-center justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight">流量</h1>
-          <p className="text-muted-foreground text-sm">全局录制代理 · 所有 HTTP 往来</p>
+        <div className="flex items-baseline gap-3">
+          <h1 className="text-base font-semibold tracking-tight">流量</h1>
+          <span className="text-muted-foreground text-xs">全局录制代理 · 所有 HTTP 往来</span>
         </div>
         <div className="flex items-center gap-4 text-sm">
           <span
@@ -364,7 +409,7 @@ export default function TrafficPage() {
       </div>
 
       {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
           <PopoverTrigger asChild>
             <Button variant="outline" size="sm" className="h-8">
@@ -513,6 +558,18 @@ export default function TrafficPage() {
             ))}
           </SelectContent>
         </Select>
+        <Button
+          variant={advancedOpen ? "secondary" : "outline"}
+          size="sm"
+          className="h-8"
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          <SlidersHorizontalIcon className="size-3.5" />
+          高级筛选
+          {hasAdvancedFilter ? (
+            <span className="ml-1 size-1.5 rounded-full bg-primary" aria-label="有生效的高级筛选" />
+          ) : null}
+        </Button>
 
         <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
           <span className="tabular-nums">
@@ -542,67 +599,70 @@ export default function TrafficPage() {
         </div>
       </div>
 
-      {/* Advanced filters (issue #177): narrow 660k+ exchanges down to the one packet. */}
-      <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
-        <span className="pl-1 text-xs font-medium text-muted-foreground">高级筛选</span>
-        <div className="relative w-56">
-          <Input
-            placeholder="响应内容（正文关键词，≥3字）"
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            className="h-8"
-          />
+      {/* Advanced filters (issue #177): narrow 660k+ exchanges down to the one packet.
+          默认收起成一行按钮；展开（或已有生效筛选）时显示完整筛选块。 */}
+      {advancedOpen || hasAdvancedFilter ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
+          <span className="pl-1 text-xs font-medium text-muted-foreground">高级筛选</span>
+          <div className="relative w-56">
+            <Input
+              placeholder="响应内容（正文关键词，≥3字）"
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              className="h-8"
+            />
+          </div>
+          <div className="relative w-52">
+            <Input
+              placeholder="路径（如 /api/user/…）"
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              className="h-8"
+            />
+          </div>
+          <Select value={statusFilter} onValueChange={setStatusFilter}>
+            <SelectTrigger size="sm" className="w-28">
+              <SelectValue placeholder="状态码" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部状态码</SelectItem>
+              {STATUS_BUCKETS.map((s) => (
+                <SelectItem key={s} value={s}>
+                  {s}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="flex items-center gap-1 text-xs text-muted-foreground">
+            <span>响应长度</span>
+            <Input
+              type="number"
+              min={0}
+              placeholder="最小(B)"
+              value={respMin}
+              onChange={(e) => setRespMin(e.target.value)}
+              className="h-8 w-24"
+            />
+            <span>–</span>
+            <Input
+              type="number"
+              min={0}
+              placeholder="最大(B)"
+              value={respMax}
+              onChange={(e) => setRespMax(e.target.value)}
+              className="h-8 w-24"
+            />
+          </div>
+          {hasAdvancedFilter ? (
+            <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
+              <FilterXIcon className="size-3.5" />
+              清除筛选
+            </Button>
+          ) : null}
         </div>
-        <div className="relative w-52">
-          <Input
-            placeholder="路径（如 /api/user/…）"
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            className="h-8"
-          />
-        </div>
-        <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger size="sm" className="w-28">
-            <SelectValue placeholder="状态码" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">全部状态码</SelectItem>
-            {STATUS_BUCKETS.map((s) => (
-              <SelectItem key={s} value={s}>
-                {s}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <div className="flex items-center gap-1 text-xs text-muted-foreground">
-          <span>响应长度</span>
-          <Input
-            type="number"
-            min={0}
-            placeholder="最小(B)"
-            value={respMin}
-            onChange={(e) => setRespMin(e.target.value)}
-            className="h-8 w-24"
-          />
-          <span>–</span>
-          <Input
-            type="number"
-            min={0}
-            placeholder="最大(B)"
-            value={respMax}
-            onChange={(e) => setRespMax(e.target.value)}
-            className="h-8 w-24"
-          />
-        </div>
-        {hasAdvancedFilter ? (
-          <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
-            <FilterXIcon className="size-3.5" />
-            清除筛选
-          </Button>
-        ) : null}
-      </div>
+      ) : null}
 
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <span className="text-sm text-muted-foreground">已选 {selectedFlows.size} 条流量</span>
         <Button variant="outline" size="sm" disabled={selectedFlows.size === 0} onClick={() => setLinking(true)}>
           关联到漏洞
@@ -614,10 +674,10 @@ export default function TrafficPage() {
         ) : null}
       </div>
       {/* History table */}
-      <div className="flex h-[calc(100vh-15rem)] min-h-0 flex-col">
-        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden py-0">
+      <div className="flex min-h-0 flex-1 flex-col">
+        <Card className="flex min-h-0 flex-col overflow-hidden py-0" style={detail ? { height: listH } : undefined}>
           <div className="min-h-0 flex-1 overflow-auto">
-            <Table>
+            <Table className="[&_td]:px-3 [&_td]:py-1 [&_th]:px-3 [&_th]:py-1.5">
               <TableHeader className="sticky top-0 z-10 bg-card">
                 <TableRow>
                   <TableHead className="w-10">
@@ -726,51 +786,107 @@ export default function TrafficPage() {
           onBound={() => setSelectedFlows(new Set())}
         />
       ) : null}
-      <Sheet open={selected !== null} onOpenChange={(open) => !open && setSelected(null)}>
-        <SheetContent className="w-full! max-w-none! gap-0 p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
-          {selected && (
-            <>
-              <SheetHeader className="border-b px-5 py-4">
-                <div className="flex items-center gap-2 pr-8">
-                  <MethodBadge method={selected.method} />
-                  <Badge variant="secondary" className={cn("font-mono tabular-nums", statusTone(selected.status))}>
-                    {selected.status}
-                  </Badge>
-                  <span className="ml-auto text-xs text-muted-foreground tabular-nums">{fmtTime(selected.ts)}</span>
-                </div>
-                <SheetTitle className="break-all font-mono">{selected.host}</SheetTitle>
-                <SheetDescription className="break-all font-mono">{selected.url}</SheetDescription>
-              </SheetHeader>
-              <Tabs defaultValue="request" className="min-h-0 flex-1 gap-0">
-                <TabsList className="mx-5 mt-4 grid w-auto grid-cols-2">
-                  <TabsTrigger value="request">请求 Request</TabsTrigger>
-                  <TabsTrigger value="response">响应 Response</TabsTrigger>
-                </TabsList>
-                <TabsContent value="request" className="min-h-0 overflow-auto">
-                  {detailLoading ? (
-                    <div className="flex items-center gap-2 p-5 text-xs text-muted-foreground">
-                      <Loader2Icon className="size-3.5 animate-spin" />
-                      加载报文…
-                    </div>
-                  ) : (
-                    <HttpCodeBlock raw={requestWithHost(detail?.req ?? "", selected)} />
-                  )}
-                </TabsContent>
-                <TabsContent value="response" className="min-h-0 overflow-auto">
-                  {detailLoading ? (
-                    <div className="flex items-center gap-2 p-5 text-xs text-muted-foreground">
-                      <Loader2Icon className="size-3.5 animate-spin" />
-                      加载报文…
-                    </div>
-                  ) : (
-                    <HttpCodeBlock raw={detail?.resp ?? ""} />
-                  )}
-                </TabsContent>
-              </Tabs>
-            </>
-          )}
-        </SheetContent>
-      </Sheet>
+      {detail ? (
+        <div
+          className="h-1.5 shrink-0 cursor-row-resize bg-border/60 transition-colors hover:bg-primary/50"
+          onMouseDown={startListDrag}
+          title="拖动调整流量列表高度"
+        />
+      ) : null}
+      {selected ? (
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden py-0">
+          <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+            <MethodBadge method={selected.method} />
+            <Badge variant="secondary" className={cn("font-mono tabular-nums", statusTone(selected.status))}>
+              {selected.status}
+            </Badge>
+            <span className="min-w-0 flex-1 break-all font-mono text-xs">{selected.url}</span>
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="text-xs text-muted-foreground tabular-nums">{fmtTime(selected.ts)}</span>
+              <Button size="sm" variant="outline" disabled={replayLoading} onClick={doReplay}>
+                {replayLoading ? <Loader2Icon className="size-3.5 animate-spin" /> : <PlayIcon className="size-3.5" />}
+                重放
+              </Button>
+              <Button size="sm" variant="ghost" aria-label="关闭详情" onClick={() => setSelected(null)}>
+                <XIcon className="size-3.5" />
+              </Button>
+            </div>
+          </div>
+          <div className="grid min-h-0 flex-1 grid-cols-2 overflow-hidden">
+            <div className="flex min-h-0 flex-col border-r border-border/60">
+              <div className="bg-muted/60 px-3 py-1.5 text-xs font-semibold">
+                请求 Request
+                {editedReq !== requestWithHost(detail?.req ?? "", selected) ? (
+                  <span className="ml-2 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-600">已修改</span>
+                ) : null}
+                <button
+                  className="ml-2 text-[10px] text-muted-foreground underline"
+                  onClick={() => setEditedReq(requestWithHost(detail?.req ?? "", selected))}
+                >
+                  还原
+                </button>
+              </div>
+              <textarea
+                value={editedReq}
+                onChange={(e) => setEditedReq(e.target.value)}
+                spellCheck={false}
+                className="min-h-0 flex-1 resize-none bg-transparent px-3 py-2 font-mono text-xs leading-5 outline-none"
+              />
+            </div>
+            <div className="flex min-h-0 flex-col">
+              <div className="flex items-center gap-2 bg-muted/60 px-3 py-1.5 text-xs font-semibold">
+                响应 Response
+                {replay ? (
+                  <div className="ml-2 flex overflow-hidden rounded border text-[10px]">
+                    <button
+                      className={cn(
+                        "px-2 py-0.5",
+                        !showReplayResp ? "bg-primary/15 font-medium text-primary" : "text-muted-foreground",
+                      )}
+                      onClick={() => setShowReplayResp(false)}
+                    >
+                      原始
+                    </button>
+                    <button
+                      className={cn(
+                        "px-2 py-0.5",
+                        showReplayResp ? "bg-primary/15 font-medium text-primary" : "text-muted-foreground",
+                      )}
+                      onClick={() => setShowReplayResp(true)}
+                    >
+                      重放
+                    </button>
+                  </div>
+                ) : null}
+                <span className="ml-auto text-[10px] font-normal text-muted-foreground">
+                  {showReplayResp && replay ? `重放耗时 ${replay.ms} ms` : ""}
+                </span>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto">
+                {detailLoading ? (
+                  <div className="flex items-center gap-2 p-5 text-xs text-muted-foreground">
+                    <Loader2Icon className="size-3.5 animate-spin" />
+                    加载报文…
+                  </div>
+                ) : (
+                  <HttpCodeBlock
+                    raw={showReplayResp && replay ? replay.resp : (detail?.resp ?? "")}
+                    className="max-h-none"
+                  />
+                )}
+                {showReplayResp && replay ? (
+                  <details className="border-t border-border/60 px-3 py-2">
+                    <summary className="cursor-pointer text-xs text-muted-foreground">重放发出的请求原文</summary>
+                    <pre className="mt-2 overflow-auto whitespace-pre-wrap break-all font-mono text-xs">
+                      {replay.req}
+                    </pre>
+                  </details>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </Card>
+      ) : null}
 
       <AlertDialog
         open={deleteMode !== null}

@@ -42,6 +42,7 @@ type Task struct {
 	TimeoutSeconds int        `json:"timeout_seconds"`        // 0=不限时
 	FirstRunAt     *time.Time `json:"first_run_at,omitempty"` // 首次真正开始运行的时刻(非 created_at);nil=尚未运行
 	DeadlineAt     *time.Time `json:"deadline_at,omitempty"`  // = first_run_at + timeout_seconds;nil=不限或未运行
+	ScheduledAt    *time.Time `json:"scheduled_at,omitempty"` // 定时执行时刻;nil=未排程。仅 status='created' 的任务会带排程，到点由 server 调度循环自动启动并清空本列。
 	// planner 心跳触发间隔(秒)：距上轮 plan 结束/任务开始满该值且期间无触发 → 触发一轮。
 	// 下限=默认=300(5min)，低于一律抬到 300(在 CreateTask 归一)。见 docs/planner-trigger-impl-plan.md
 	PlanHeartbeatSeconds int `json:"plan_heartbeat_seconds"`
@@ -328,6 +329,24 @@ SELECT $1, id FROM tasks WHERE id=$2 AND deleted_at IS NULL`, taskID, sourceID)
 	return nil
 }
 
+// ReplaceTaskRelations 整体替换任务的关联来源任务（编辑任务用）：事务内先删后插。
+// 仅 created/终态任务可由 server 侧约束调用；running 任务替换只读继承上下文会造成
+// 进行中执行与任务定义不一致。
+func (d *DB) ReplaceTaskRelations(taskID int64, sourceIDs []int64) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM task_relations WHERE task_id=$1`, taskID); err != nil {
+		return err
+	}
+	if err := insertTaskRelations(tx, taskID, sourceIDs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 	seen := map[int64]bool{}
 	for position, profileID := range profileIDs {
@@ -344,11 +363,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, scheduled_at`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.ScheduledAt); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
@@ -392,6 +411,48 @@ ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, id DESC`)
 type TaskPatch struct {
 	Name   *string
 	Pinned *bool
+}
+
+// TaskCorePatch edits the task's defining fields (描述/目标/分类/超时/心跳/覆盖度).
+// server 侧约束状态：description/goal 仅 created 与终态任务可改（running 任务的执行
+// 上下文已随 seed/planner 形成，改任务级字段不影响进行中的执行，会造成认知不一致——
+// 运行中调整目标走 goals 管理，planner 会被显式唤醒）。
+type TaskCorePatch struct {
+	Name                 *string
+	Description          *string
+	Goal                 *string
+	CategoryID           *int64
+	TimeoutSeconds       *int
+	PlanHeartbeatSeconds *int
+	CoverageEnabled      *bool
+}
+
+// UpdateTaskCore applies a partial edit of the task's defining fields and returns
+// the updated row (nil when the task is missing/deleted).
+func (d *DB) UpdateTaskCore(id int64, patch TaskCorePatch) (*Task, error) {
+	task, err := scanTask(d.QueryRow(`UPDATE tasks SET
+	name         = COALESCE($2, name),
+	description  = COALESCE($3, description),
+	goal         = COALESCE($4, goal),
+	category_id  = COALESCE($5, category_id),
+	timeout_seconds = COALESCE($6, timeout_seconds),
+	plan_heartbeat_seconds = COALESCE($7, plan_heartbeat_seconds),
+	coverage_enabled = COALESCE($8, coverage_enabled),
+	updated_at = now()
+WHERE id=$1 AND deleted_at IS NULL
+RETURNING `+taskCols,
+		id, patch.Name, patch.Description, patch.Goal, patch.CategoryID,
+		patch.TimeoutSeconds, patch.PlanHeartbeatSeconds, patch.CoverageEnabled))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := d.hydrateTasksContext([]*Task{task}); err != nil {
+		return nil, err
+	}
+	return task, nil
 }
 
 // UpdateTask applies a partial task name/pin mutation and returns the updated row.
@@ -519,6 +580,38 @@ UPDATE tasks
  WHERE id = $1
  RETURNING deadline_at`, id, timeoutSeconds).Scan(&deadline)
 	return deadline, err
+}
+
+// SetTaskScheduled 设置或清除任务的定时执行时刻。仅对尚未启动(status='created')的任务有意义；
+// 调用方负责校验状态。at=nil 清除排程。
+func (d *DB) SetTaskScheduled(id int64, at *time.Time) error {
+	_, err := d.Exec(`UPDATE tasks SET scheduled_at = $2, updated_at = now() WHERE id = $1`, id, at)
+	return err
+}
+
+// ClaimDueScheduledTasks 原子认领所有到期的定时任务：把 scheduled_at<=now 且仍处于
+// created(未启动、未删除)的任务的 scheduled_at 清空并返回其 id。原子性保证重启后的
+// 调度循环与并发 tick 不会重复启动同一任务。调用方对返回的每个 id 执行启动流程。
+func (d *DB) ClaimDueScheduledTasks(now time.Time) ([]int64, error) {
+	rows, err := d.Query(`
+UPDATE tasks
+   SET scheduled_at = NULL, updated_at = now()
+ WHERE scheduled_at IS NOT NULL AND scheduled_at <= $1
+   AND status = 'created' AND deleted_at IS NULL
+RETURNING id`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // DeleteTask preserves the historical behavior: remove the task and its

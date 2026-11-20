@@ -1169,6 +1169,20 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 	return exists, err
 }
 
+// ResetMetGoals puts every met goal back to open so a re-run ("重新进行") of a
+// terminal task actually re-plans toward them instead of instantly re-concluding
+// "all goals met" and falling done again. Facts/assets from previous runs are kept
+// as history. Returns the number of goals reopened.
+func (s *ExplorationStore) ResetMetGoals() (int64, error) {
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', updated_at=now()
+WHERE exploration_id=$1 AND kind='goal' AND state='met'`, s.expID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1

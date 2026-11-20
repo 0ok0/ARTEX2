@@ -261,6 +261,8 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    runMode?: "immediate" | "never" | "scheduled"; // 执行方式;缺省=立即执行(现状)
+    scheduledAt?: string; // RFC3339;runMode="scheduled" 时必填
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -275,10 +277,42 @@ export const api = {
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      run_mode: input.runMode ?? "immediate",
+      scheduled_at: input.scheduledAt ?? "",
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
+  // editTask 编辑任务定义字段（描述/目标/关联任务仅 created 与终态任务可改；其余字段任意状态可改）。
+  // scheduledAt 仅未启动任务可传：RFC3339=设置/改期排程，""=取消排程。
+  editTask: (
+    id: string,
+    input: {
+      name?: string;
+      description?: string;
+      goal?: string;
+      categoryId?: number;
+      timeoutSeconds?: number;
+      planHeartbeatSeconds?: number;
+      coverageEnabled?: boolean;
+      sourceTaskIds?: string[];
+      scheduledAt?: string;
+    },
+  ) =>
+    put<Task>(`/tasks/${id}/edit`, {
+      name: input.name,
+      description: input.description,
+      goal: input.goal,
+      category_id: input.categoryId,
+      timeout_seconds: input.timeoutSeconds,
+      plan_heartbeat_seconds: input.planHeartbeatSeconds,
+      coverage_enabled: input.coverageEnabled,
+      source_task_ids: input.sourceTaskIds,
+      scheduled_at: input.scheduledAt,
+    }),
+  // rerunTask 重新进行一个已结束(done/failed/timeout)的任务：保留图/资产/目标，planner 据现状继续。
+  rerunTask: (id: string) =>
+    post<{ id: string; status: string; queued: boolean }>(`/tasks/${id}/rerun`, {}),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
   renameTaskCategory: (id: number, name: string) => patch<TaskCategory>(`/task-categories/${id}`, { name }),
@@ -313,7 +347,7 @@ export const api = {
       active_llm_profile_id: activeLLMProfileId ?? null,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
-  controlTask: (id: string, action: "pause" | "resume") =>
+  controlTask: (id: string, action: "pause" | "resume" | "start") =>
     post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
   controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>
     post<{ items: BatchControlItem[] }>("/tasks/control/batch", { task_ids: taskIds, action }),
@@ -804,6 +838,7 @@ export const api = {
         (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
+  trafficReplay: (payload: { req: string; scheme: string }) => post<TrafficDetail>("/traffic/replay", payload),
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
